@@ -1,0 +1,257 @@
+<!DOCTYPE html><html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Pro BTC & Gold Trading Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+  <style>
+    body{
+      margin:0;
+      background:#0b0f1a;
+      color:#e5e7eb;
+      font-family:Inter, Arial, sans-serif;
+    }
+    header{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      padding:12px 16px;
+      background:#020617;
+      border-bottom:1px solid #1e293b;
+    }
+    #chart{ height:55vh; }
+    .panel{
+      padding:12px 16px;
+      background:#020617;
+      border-top:1px solid #1e293b;
+      font-size:14px;
+    }
+    .buy{color:#22c55e;font-weight:700;}
+    .sell{color:#ef4444;font-weight:700;}
+    .wait{color:#facc15;font-weight:700;}
+    @media(max-width:768px){
+      header h3{font-size:16px;}
+      #chart{height:60vh;}
+    }
+  </style>
+</head>
+<body><header>
+  <h3>📊 Professional Trading View</h3>
+  <div>
+    <label>Market: </label>
+    <select id="market">
+      <option value="BTC">BTC (Crypto)</option>
+      <option value="XAU">Gold (XAUUSD)</option>
+    </select>
+  </div>
+</header><!-- Session Info --><div class="panel">
+  <strong>⏱ Session:</strong> <span id="session">Loading...</span>
+</div><div id="chart"></div><div class="panel">
+  <h4>📌 Trade Decision</h4>
+  <p id="signal" class="wait">WAIT</p>
+  <p id="reason">Market not aligned</p>
+</div><script>
+const chart = LightweightCharts.createChart(document.getElementById('chart'),{
+  layout:{ background:{color:'#0b0f1a'}, textColor:'#cbd5f5' },
+  grid:{ vertLines:{color:'#1e293b'}, horzLines:{color:'#1e293b'} },
+  rightPriceScale:{ borderColor:'#334155' },
+  timeScale:{ borderColor:'#334155', timeVisible:true }
+});
+
+// Candlestick Series (Professional Look)
+const candleSeries = chart.addCandlestickSeries({
+  upColor:'#22c55e', downColor:'#ef4444',
+  borderUpColor:'#22c55e', borderDownColor:'#ef4444',
+  wickUpColor:'#22c55e', wickDownColor:'#ef4444'
+});
+
+const ema20 = chart.addLineSeries({color:'#22c55e', lineWidth:2});
+const ema50 = chart.addLineSeries({color:'#38bdf8', lineWidth:2});
+const ema200 = chart.addLineSeries({color:'#ef4444', lineWidth:2});
+
+// Liquidity Zones (visual boxes)
+const liquidityHigh = chart.addLineSeries({ color:'#f97316', lineStyle:2 });
+const liquidityLow = chart.addLineSeries({ color:'#f97316', lineStyle:2 });
+
+// Order Block & FVG visuals
+const orderBlock = chart.addLineSeries({ color:'#8b5cf6', lineWidth:3 });
+const fvgZone = chart.addLineSeries({ color:'#06b6d4', lineWidth:2 });({ color:'#f97316', lineStyle:2 });
+const liquidityLow = chart.addLineSeries({ color:'#f97316', lineStyle:2 });({color:'#ef4444', lineWidth:2});
+
+// LIVE PRICE via Binance (BTC) / simulated Gold fallback
+let socket;
+function loadLiveBTC(){
+  if(socket) socket.close();
+  socket = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_1m');
+  const liveData=[];
+  socket.onmessage = (e)=>{
+    const k = JSON.parse(e.data).k;
+    const candle={
+      time: Math.floor(k.t/1000),
+      open: +k.o, high:+k.h, low:+k.l, close:+k.c
+    };
+    liveData.push(candle);
+    candleSeries.update(candle);
+  };
+}
+
+function generateData(multiplier){
+  const d=[]; let p=multiplier;
+  for(let i=1;i<=80;i++){
+    let o=p;
+    p+= (Math.random()-0.45)*multiplier*0.02;
+    let c=p;
+    d.push({time:i, open:o, high:Math.max(o,c)+multiplier*0.01, low:Math.min(o,c)-multiplier*0.01, close:c});
+  }
+  return d;
+}
+
+function EMA(period,data,index){
+  let k=2/(period+1), ema=data[0].close;
+  for(let i=1;i<=index;i++) ema=data[i].close*k+ema*(1-k);
+  return ema;
+}
+
+function RSI(data,period){
+  let g=0,l=0;
+  for(let i=data.length-period;i<data.length;i++){
+    let d=data[i].close-data[i-1].close;
+    d>=0?g+=d:l-=d;
+  }
+  let rs=g/(l||1);
+  return 100-(100/(1+rs));
+}
+
+// Liquidity Sweep Detection
+function detectLiquiditySweep(data){
+  const last = data.length - 1;
+  const prevHigh = Math.max(...data.slice(last-10,last).map(d=>d.high));
+  const prevLow = Math.min(...data.slice(last-10,last).map(d=>d.low));
+
+  if(data[last].high > prevHigh && data[last].close < prevHigh){
+    return 'SELL_SWEEP'; // Buy-side liquidity taken
+  }
+  if(data[last].low < prevLow && data[last].close > prevLow){
+    return 'BUY_SWEEP'; // Sell-side liquidity taken
+  }
+  return 'NONE';
+}
+
+// Fake Breakout Filter
+function fakeBreakout(data){
+  const last = data.length - 1;
+  const range = data[last].high - data[last].low;
+  const body = Math.abs(data[last].close - data[last].open);
+  return body < range * 0.3; // long wick, weak body
+}
+
+// Break of Structure (BOS / CHoCH)
+// Higher Timeframe Bias (HTF)
+function getHTFBias(data){
+  const last=data.length-1;
+  return data[last].close > EMA(200,data,last) ? 'BULLISH' : 'BEARISH';
+}
+
+// Break of Structure (BOS / CHoCH)
+function detectStructure(data){(data){
+  const l=data.length-1;
+  if(data[l].high>data[l-2].high && data[l-1].high<data[l-2].high) return 'BOS_UP';
+  if(data[l].low<data[l-2].low && data[l-1].low>data[l-2].low) return 'BOS_DOWN';
+  return 'NONE';
+}
+
+// Fair Value Gap (FVG) detection
+function detectFVG(data){
+  const l=data.length-1;
+  if(l<3) return null;
+  const prev2=data[l-2], prev1=data[l-1], cur=data[l];
+  if(prev2.high < cur.low) return {type:'BULL', level:(prev2.high+cur.low)/2};
+  if(prev2.low > cur.high) return {type:'BEAR', level:(prev2.low+cur.high)/2};
+  return null;
+}
+
+// Order Block detection (last strong candle before BOS)
+function detectOrderBlock(data,structure){
+  const l=data.length-2;
+  if(structure==='BOS_UP') return data[l].low;
+  if(structure==='BOS_DOWN') return data[l].high;
+  return null;
+}
+
+// Prop Firm Daily Loss Guard
+let dailyLoss=0;
+const maxDailyLossPercent=2;
+
+function loadMarket(type){
+  const base = type==='BTC'?42000:2000;
+  const data = generateData(base);
+  candleSeries.setData(data);
+
+  ema20.setData(data.map((d,i)=>({time:d.time,value:EMA(20,data,i)})));
+  ema50.setData(data.map((d,i)=>({time:d.time,value:EMA(50,data,i)})));
+  ema200.setData(data.map((d,i)=>({time:d.time,value:EMA(200,data,i)})));
+
+  // Liquidity Zones (last 20 candles)
+  const highs=data.slice(-20).map(d=>d.high);
+  const lows=data.slice(-20).map(d=>d.low);
+  const h=Math.max(...highs), l=Math.min(...lows);
+  liquidityHigh.setData(data.map(d=>({time:d.time,value:h})));
+  liquidityLow.setData(data.map(d=>({time:d.time,value:l})));(data.map((d,i)=>({time:d.time,value:EMA(200,data,i)})));
+
+  const last=data.length-1;
+  const structure = detectStructure(data);
+  const htfBias = getHTFBias(data);
+  const fvg = detectFVG(data);
+  const ob = detectOrderBlock(data,structure);
+
+  if(fvg) fvgZone.setData(data.map(d=>({time:d.time,value:fvg.level})));
+  if(ob) orderBlock.setData(data.map(d=>({time:d.time,value:ob})));(data);
+  const rsi=RSI(data,14);
+  let signal='WAIT', reason='No confirmation';
+
+  if(dailyLoss>=maxDailyLossPercent){
+    reason='🚫 Daily loss limit hit – trading locked';
+    document.getElementById('reason').textContent=reason;
+    return;
+  }
+
+  // Session Filter
+  const hr = new Date().getUTCHours();
+  let session='Asia';
+  if(hr>=7 && hr<10) session='London Kill Zone';
+  if(hr>=13 && hr<16) session='New York Kill Zone';
+  document.getElementById('session').textContent=session;
+
+  if(session==='Asia') reason='Low probability session';
+
+  const sweep = detectLiquiditySweep(data);
+  const fake = fakeBreakout(data);
+
+  if(session!=='Asia' && htfBias==='BULLISH' && data[last].close>EMA(200,data,last) && EMA(20,data,last)>EMA(50,data,last) && rsi>50 && sweep==='BUY_SWEEP' && !fake){
+    signal='BUY'; reason='Bull trend + EMA + RSI';
+  }else if(session!=='Asia' && htfBias==='BEARISH' && data[last].close<EMA(200,data,last) && EMA(20,data,last)<EMA(50,data,last) && rsi<50 && sweep==='SELL_SWEEP' && !fake){
+    signal='SELL'; reason='Bear trend + EMA + RSI';
+  }
+
+  const el=document.getElementById('signal');
+  el.textContent=signal;
+  el.className=signal==='BUY'?'buy':signal==='SELL'?'sell':'wait';
+  if(sweep!=='NONE') reason += ' | Liquidity Sweep Confirmed';
+  if(fake) reason += ' | Fake Breakout Filter Active';
+  // Auto SL TP (RR)
+  if(signal!=='WAIT'){
+    const entry=data[last].close;
+    const sl = signal==='BUY'? liquidityLow.options().value : liquidityHigh.options().value;
+    const risk=Math.abs(entry-sl);
+    const tp = signal==='BUY'? entry + risk*2 : entry - risk*2;
+    dailyLoss += 0.5; // simulate risk usage
+    reason += ` | SL: ` ${sl.toFixed(2)} TP: ${tp.toFixed(2)} RR 1:2`;
+  }
+  if(structure!=='NONE') reason += ` | ${structure}`;
+  document.getElementById('reason').textContent=reason;
+}
+
+loadMarket('BTC');
+
+document.getElementById('market').addEventListener('change',e=>loadMarket(e.target.value));
+</script></body>
+</html>
